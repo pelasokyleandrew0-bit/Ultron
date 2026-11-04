@@ -103,11 +103,13 @@ class ActionExecutor(private val ctx: Context) {
             return "Contacts permission has not been granted."
         }
         val sb = StringBuilder()
-        val phone = ContactsContract.CommonDataKinds.Phone
+        val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+        val nameCol = ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
+        val numberCol = ContactsContract.CommonDataKinds.Phone.NUMBER
         ctx.contentResolver.query(
-            phone.CONTENT_URI,
-            arrayOf(phone.DISPLAY_NAME, phone.NUMBER),
-            "${phone.DISPLAY_NAME} LIKE ?",
+            uri,
+            arrayOf(nameCol, numberCol),
+            "$nameCol LIKE ?",
             arrayOf("%$name%"),
             null
         )?.use { c ->
