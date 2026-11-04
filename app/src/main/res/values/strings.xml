@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ultron</string>
+    <string name="a11y_description">Lets Ultron read the screen, tap buttons, type, and scroll when you ask it to.</string>
+</resources>
