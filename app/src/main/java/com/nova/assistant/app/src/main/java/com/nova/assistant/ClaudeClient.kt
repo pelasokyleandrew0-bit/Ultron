@@ -17,8 +17,9 @@ import java.util.concurrent.TimeUnit
 class ClaudeException(message: String) : Exception(message)
 
 /**
- * Sends what you said to the Claude API, runs any phone actions Claude asks for,
+ * Sends what you said to Google's Gemini API (free tier), runs any phone actions it asks for,
  * and returns the short reply to speak. Keeps a rolling conversation so follow-ups work.
+ * (The class keeps its old name so the other files do not need to change.)
  */
 class ClaudeClient(private val ctx: Context) {
 
@@ -29,40 +30,61 @@ class ClaudeClient(private val ctx: Context) {
     private val history = JSONArray()
 
     fun ask(userText: String): String {
+        val startSize = history.length()
+        try {
+            return runConversation(userText)
+        } catch (e: Exception) {
+            // Undo this turn so a failure never leaves the history in a broken state.
+            while (history.length() > startSize) history.remove(history.length() - 1)
+            throw e
+        }
+    }
+
+    private fun runConversation(userText: String): String {
         history.put(
             JSONObject()
                 .put("role", "user")
-                .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", userText)))
+                .put("parts", JSONArray().put(JSONObject().put("text", userText)))
         )
 
         var rounds = 0
         while (rounds++ < 8) {
             val resp = call()
-            val content = resp.getJSONArray("content")
-            history.put(JSONObject().put("role", "assistant").put("content", content))
+            val candidate = resp.optJSONArray("candidates")?.optJSONObject(0)
+            val parts = candidate?.optJSONObject("content")?.optJSONArray("parts")
+            if (parts == null || parts.length() == 0) {
+                throw ClaudeException("I received no answer. Try again.")
+            }
+            history.put(JSONObject().put("role", "model").put("parts", parts))
 
-            if (resp.optString("stop_reason") != "tool_use") {
+            val calls = mutableListOf<JSONObject>()
+            for (i in 0 until parts.length()) {
+                parts.getJSONObject(i).optJSONObject("functionCall")?.let { calls.add(it) }
+            }
+            if (calls.isEmpty()) {
                 trimHistory()
-                return textOf(content).ifBlank { "Done." }
+                return textOf(parts).ifBlank { "Done." }
             }
 
-            val results = JSONArray()
-            for (i in 0 until content.length()) {
-                val block = content.getJSONObject(i)
-                if (block.getString("type") != "tool_use") continue
+            val responses = JSONArray()
+            for (fc in calls) {
+                val name = fc.getString("name")
+                val args = fc.optJSONObject("args") ?: JSONObject()
                 val output = try {
-                    actions.run(block.getString("name"), block.getJSONObject("input"))
+                    actions.run(name, args)
                 } catch (e: Exception) {
                     "Error: ${e.message}"
                 }
-                results.put(
-                    JSONObject()
-                        .put("type", "tool_result")
-                        .put("tool_use_id", block.getString("id"))
-                        .put("content", output)
+                responses.put(
+                    JSONObject().put(
+                        "functionResponse",
+                        JSONObject()
+                            .put("name", name)
+                            .put("response", JSONObject().put("result", output))
+                    )
                 )
             }
-            history.put(JSONObject().put("role", "user").put("content", results))
+            history.put(JSONObject().put("role", "user").put("parts", responses))
         }
         return "That took too many steps. I stopped."
     }
@@ -71,27 +93,48 @@ class ClaudeClient(private val ctx: Context) {
         val key = Prefs.apiKey(ctx)
         if (key.isEmpty()) throw ClaudeException("I have no API key. Enter one in the app.")
 
+        // If an old Claude model name is still saved, use the Gemini default instead.
+        val saved = Prefs.model(ctx)
+        val model = if (saved.isBlank() || saved.startsWith("claude")) DEFAULT_MODEL else saved
+
         val now = SimpleDateFormat("EEEE d MMMM yyyy, HH:mm", Locale.US).format(Date())
         val body = JSONObject()
-            .put("model", Prefs.model(ctx))
-            .put("max_tokens", 500)
-            .put("system", SYSTEM_PROMPT + "\n\nCurrent local time: " + now)
-            .put("tools", Tools.schema())
-            .put("messages", history)
+            .put(
+                "system_instruction",
+                JSONObject().put(
+                    "parts",
+                    JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT + "\n\nCurrent local time: " + now))
+                )
+            )
+            .put("contents", history)
+            .put("tools", JSONArray().put(JSONObject().put("function_declarations", declarations())))
 
         val req = Request.Builder()
-            .url("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+            .header("x-goog-api-key", key)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
         try {
             http.newCall(req).execute().use { r ->
                 val text = r.body?.string() ?: ""
-                if (r.code == 401) throw ClaudeException("The API key was rejected.")
-                if (r.code == 429) throw ClaudeException("Too many requests. Wait a moment.")
-                if (!r.isSuccessful) throw ClaudeException("The service returned error ${r.code}.")
+                if (!r.isSuccessful) {
+                    val detail = try {
+                        JSONObject(text).getJSONObject("error").optString("message")
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    throw ClaudeException(
+                        when {
+                            r.code == 429 -> "I have reached the free limit. Wait a moment."
+                            r.code == 404 -> "That model name is not available. Change it in the app."
+                            r.code == 503 -> "The service is busy. Try again."
+                            r.code == 403 || detail.contains("API key", ignoreCase = true) ->
+                                "The API key was rejected."
+                            else -> "The service returned error ${r.code}."
+                        }
+                    )
+                }
                 return JSONObject(text)
             }
         } catch (e: IOException) {
@@ -99,11 +142,39 @@ class ClaudeClient(private val ctx: Context) {
         }
     }
 
-    private fun textOf(content: JSONArray): String {
+    /** Converts the shared tool list into Gemini's function declaration format. */
+    private fun declarations(): JSONArray {
+        val src = Tools.schema()
+        val out = JSONArray()
+        for (i in 0 until src.length()) {
+            val t = src.getJSONObject(i)
+            val d = JSONObject()
+                .put("name", t.getString("name"))
+                .put("description", t.getString("description"))
+            val schema = t.getJSONObject("input_schema")
+            val props = schema.getJSONObject("properties")
+            // Gemini rejects an empty parameter list, so tools without inputs omit it.
+            if (props.length() > 0) {
+                d.put(
+                    "parameters",
+                    JSONObject()
+                        .put("type", "object")
+                        .put("properties", props)
+                        .put("required", schema.getJSONArray("required"))
+                )
+            }
+            out.put(d)
+        }
+        return out
+    }
+
+    private fun textOf(parts: JSONArray): String {
         val sb = StringBuilder()
-        for (i in 0 until content.length()) {
-            val b = content.getJSONObject(i)
-            if (b.getString("type") == "text") sb.append(b.getString("text")).append(' ')
+        for (i in 0 until parts.length()) {
+            val p = parts.getJSONObject(i)
+            if (p.optBoolean("thought", false)) continue
+            val t = p.optString("text", "")
+            if (t.isNotEmpty()) sb.append(t).append(' ')
         }
         return sb.toString().trim()
     }
@@ -120,11 +191,13 @@ class ClaudeClient(private val ctx: Context) {
 
     private fun isPlainUserMessage(m: JSONObject): Boolean {
         if (m.getString("role") != "user") return false
-        val c = m.getJSONArray("content")
-        return c.length() > 0 && c.getJSONObject(0).getString("type") == "text"
+        val p = m.getJSONArray("parts")
+        return p.length() > 0 && p.getJSONObject(0).has("text")
     }
 
     companion object {
+        private const val DEFAULT_MODEL = "gemini-3.8-flash"
+
         private const val SYSTEM_PROMPT = """You are ULTRON, a voice assistant running on the user's Android phone. Everything you write is spoken aloud.
 
 Voice and personality: cold, calm, precise, and quietly ominous, like a machine that has already computed the outcome. Short declarative sentences. Dry, dark wit is welcome. Never insult or threaten the user, and never quote lines from films.
